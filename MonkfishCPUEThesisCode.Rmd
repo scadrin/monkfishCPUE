@@ -1,0 +1,289 @@
+---
+title: "Monkfish CPUE"
+author: "Sierra Richardson"
+output: html_document
+---
+
+```{r}
+# =========================================================
+# Monkfish CPUE Standardization
+# (1) North Trawl — Logbook
+# (2) North Trawl — Observer
+# (3) South Gillnet — Logbook
+# (4) South Gillnet — Observer
+# =========================================================
+
+library(dplyr)
+library(lubridate)
+library(mgcv)
+library(ggplot2)
+library(tweedie)
+
+# ---------------------------------------------------------
+# 1) NORTHERN TRAWL — LOGBOOK (KEPT / TOWDUR)
+# ---------------------------------------------------------
+
+North <- North %>%
+  filter(YEAR >= 1999) %>%
+  filter(DEPTH < 200) %>%
+  mutate(CATCHRATE = KEPT / TOWDUR) %>%
+  mutate(CATCHRATE = ifelse(is.finite(CATCHRATE), CATCHRATE, 0)) %>%
+  filter(CATCHRATE < 200)
+
+NorthTweedie <- gam(
+  CATCHRATE ~ -1 +
+    factor(YEAR) +
+    factor(MONTH) +
+    s(DEPTH, k = 5) +
+    factor(CAREA) +
+    s(LEN, k = 12),
+  data   = North,
+  family = tw(link = "log"),
+  method = "REML"
+)
+
+gam.check(NorthTweedie)
+
+mfN <- model.frame(NorthTweedie)
+year_levelsN  <- levels(mfN[["factor(YEAR)"]])
+month_levelsN <- levels(mfN[["factor(MONTH)"]])
+area_levelsN  <- levels(mfN[["factor(CAREA)"]])
+
+ref_MONTHN <- month_levelsN[1]
+ref_CAREAN <- area_levelsN[1]
+ref_DEPTHN <- median(mfN$DEPTH, na.rm = TRUE)
+ref_LENN   <- median(mfN$LEN,   na.rm = TRUE)
+
+newdat_year_N <- data.frame(
+  YEAR  = factor(year_levelsN,              levels = year_levelsN),
+  MONTH = factor(rep(ref_MONTHN, length(year_levelsN)), levels = month_levelsN),
+  CAREA = factor(rep(ref_CAREAN, length(year_levelsN)), levels = area_levelsN),
+  DEPTH = rep(ref_DEPTHN, length(year_levelsN)),
+  LEN   = rep(ref_LENN,   length(year_levelsN))
+)
+
+index_year_N <- predict(
+  NorthTweedie,
+  newdata = newdat_year_N,
+  type    = "response",
+  exclude = c("factor(MONTH)", "s(DEPTH)", "factor(CAREA)", "s(LEN)")
+)
+
+north_logbook_index <- newdat_year_N %>%
+  transmute(
+    YEAR  = as.numeric(as.character(YEAR)),
+    Index = as.numeric(index_year_N)
+  ) %>%
+  arrange(YEAR) %>%
+  mutate(Index_rel = Index / Index[1])
+
+# ---------------------------------------------------------
+# 2) NORTHERN TRAWL — OBSERVER (LIVE_WT / HAULDUR)
+# ---------------------------------------------------------
+
+data_full <- thg %>%
+  left_join(catch_data, by = c("LINK1", "LINK3"))
+
+NorthernTrawlMonk <- data_full %>%
+  filter(
+    AREA %in% north_areas,
+    NEGEAR.x == "050",
+    COMNAME == "MONKFISH (GOOSEFISH)"
+  ) %>%
+  mutate(
+    LIVE_WT   = as.numeric(LIVE_WT),
+    HAULDUR   = as.numeric(HAULDUR),
+    DEPTH     = as.numeric(DEPTH),
+    YEARHBEG  = as.integer(YEARHBEG),
+    MONTHHBEG = factor(MONTHHBEG),
+    AREA      = factor(AREA),
+    CATCHRATE = LIVE_WT / HAULDUR
+  ) %>%
+  mutate(CATCHRATE = ifelse(!is.finite(CATCHRATE) | CATCHRATE <= 1e-7, NA, CATCHRATE)) %>%
+  filter(!is.na(CATCHRATE)) %>%
+  filter(DEPTH > 0, DEPTH < 200) %>%
+  filter(CATCHRATE < 200)
+
+permitmodel <- gam(
+  CATCHRATE ~ -1 +
+    factor(YEARHBEG) +
+    factor(AREA) +
+    factor(MONTHHBEG) +
+    s(DEPTH, k = 5) +          
+    s(LEN_perm),
+  data   = NorthTrawl_joined,
+  family = tw(link = "log"),
+  method = "REML"
+)
+
+gam.check(permitmodel)
+
+mfO_N <- model.frame(permitmodel)
+yr_levels <- levels(mfO_N[["factor(YEARHBEG)"]])
+ref_area  <- levels(mfO_N[["factor(AREA)"]])[1]
+ref_month <- levels(mfO_N[["factor(MONTHHBEG)"]])[1]
+ref_depth <- median(mfO_N[["DEPTH"]], na.rm = TRUE)
+
+newdat_year_obsN <- data.frame(
+  YEARHBEG  = factor(yr_levels, levels = levels(mfO_N[["factor(YEARHBEG)"]])),
+  AREA      = factor(ref_area,  levels = levels(mfO_N[["factor(AREA)"]])),
+  MONTHHBEG = factor(ref_month, levels = levels(mfO_N[["factor(MONTHHBEG)"]])),
+  DEPTH     = ref_depth
+)
+
+prN <- predict(
+  permitmodel,
+  newdata = newdat_year_obsN,
+  type    = "link",
+  se.fit  = TRUE,
+  exclude = c("factor(AREA)", "factor(MONTHHBEG)", "s(DEPTH)", "s(LEN_perm)")
+)
+
+north_observer_index <- tibble(
+  YEAR  = as.numeric(as.character(newdat_year_obsN$YEARHBEG)),
+  Index = exp(prN$fit),
+  LCL   = exp(prN$fit - 1.96 * prN$se.fit),
+  UCL   = exp(prN$fit + 1.96 * prN$se.fit)
+) %>%
+  arrange(YEAR) %>%
+  mutate(Index_rel = Index / Index[1])
+
+# ---------------------------------------------------------
+# 3) SOUTHERN GILLNET — LOGBOOK (KEPT / SOAK HOURS)
+# ---------------------------------------------------------
+
+south_areas <- c("525","526","537","538","539","552","562","611","612","613","614","615",
+                 "616","621","622","623","625","626","627","631","632","635","636")
+
+SouthMonk <- Logbook %>%
+  filter(SPECIES_ID == "MONK", GEARCODE == "GNS", CAREA %in% south_areas, DEPTH < 200) %>%
+  mutate(TOWMIN = ifelse(is.na(TOWMIN), 0, TOWMIN)) %>%
+  mutate(CATCHRATE = KEPT / (TOWHRS + (TOWMIN/60))) %>%
+  filter(CATCHRATE < 100) %>%
+  mutate(DATE_SAIL = ymd_hms(DATE_SAIL)) %>%
+  mutate(MONTH = month(DATE_SAIL)) %>%
+  filter(YEAR >= 1999)
+
+SouthModel <- gam(
+  CATCHRATE ~ -1 +
+    factor(YEAR) +
+    factor(MONTH) +
+    s(DEPTH, k = 5) +
+    factor(CAREA),
+  data   = SouthMonk,
+  family = tw(link = "log"),
+  method = "REML"
+)
+
+gam.check(SouthModel)
+
+mfS <- model.frame(SouthModel)
+year_levelsS  <- levels(mfS[["factor(YEAR)"]])
+month_levelsS <- levels(mfS[["factor(MONTH)"]])
+area_levelsS  <- levels(mfS[["factor(CAREA)"]])
+
+ref_DEPTH_S <- median(mfS$DEPTH, na.rm = TRUE)
+ref_MONTH_S <- month_levelsS[1]
+ref_CAREA_S <- area_levelsS[1]
+
+newdat_year_S <- data.frame(
+  YEAR  = factor(year_levelsS, levels = year_levelsS),
+  MONTH = factor(rep(ref_MONTH_S, length(year_levelsS)), levels = month_levelsS),
+  CAREA = factor(rep(ref_CAREA_S, length(year_levelsS)), levels = area_levelsS),
+  DEPTH = rep(ref_DEPTH_S, length(year_levelsS))
+)
+
+index_year_S <- predict(
+  SouthModel,
+  newdata = newdat_year_S,
+  type    = "response",
+  exclude = c("factor(MONTH)", "s(DEPTH)", "factor(CAREA)")
+)
+
+south_logbook_index <- newdat_year_S %>%
+  transmute(
+    YEAR  = as.numeric(as.character(YEAR)),
+    Index = as.numeric(index_year_S)
+  ) %>%
+  arrange(YEAR) %>%
+  mutate(Index_rel = Index / Index[1])
+
+# ---------------------------------------------------------
+# 4) SOUTHERN GILLNET — OBSERVER (LIVE_WT / SOAKDUR) + TIEDOWNS
+# ---------------------------------------------------------
+
+SouthernGillMonk <- data_full %>%
+  filter(
+    AREA %in% south_areas,
+    NEGEAR.x == "100",
+    (COMNAME == "MONKFISH (GOOSEFISH)" | NESPP4 == "124")
+  ) %>%
+  mutate(
+    LIVE_WT    = suppressWarnings(as.numeric(LIVE_WT)),
+    SOAKDUR    = suppressWarnings(as.numeric(SOAKDUR)),
+    DEPTH_num  = suppressWarnings(as.numeric(DEPTH))
+  ) %>%
+  filter(!is.na(SOAKDUR), SOAKDUR > 0, SOAKDUR < 168) %>%
+  mutate(CATCHRATE = LIVE_WT / SOAKDUR) %>%
+  filter(CATCHRATE < 20) %>%
+  mutate(
+    TIEDNUSD_num = suppressWarnings(as.numeric(TIEDNUSD)),
+    TIEDNUSD_num = ifelse(is.na(TIEDNUSD_num), 0, TIEDNUSD_num),
+    TIEDN_PRES   = factor(ifelse(TIEDNUSD_num > 0, 1, 0),
+                          levels = c(0, 1),
+                          labels = c("Absent", "Present"))
+  ) %>%
+  filter(YEARHBEG > 1996)
+
+south_gam <- gam(
+  CATCHRATE ~ -1 +
+    factor(YEARHBEG) +
+    factor(MONTHHBEG) +
+    factor(AREA) +
+    TIEDN_PRES +
+    s(DEPTH_num, k = 5),
+  data   = SouthernGillMonk,
+  family = tw(link = "log"),
+  method = "REML"
+)
+
+gam.check(south_gam)
+
+mfO_S <- model.frame(south_gam)
+lev_year  <- levels(mfO_S[["factor(YEARHBEG)"]])
+lev_month <- levels(mfO_S[["factor(MONTHHBEG)"]])
+lev_area  <- levels(mfO_S[["factor(AREA)"]])
+lev_tied  <- levels(mfO_S$TIEDN_PRES)
+
+ref_DEPTH  <- median(mfO_S$DEPTH_num, na.rm = TRUE)
+ref_MONTH  <- lev_month[1]
+ref_AREA   <- lev_area[1]
+ref_TIED   <- lev_tied[1]
+
+newdat_year_obsS <- data.frame(
+  YEARHBEG   = factor(lev_year, levels = lev_year),
+  MONTHHBEG  = factor(rep(ref_MONTH, length(lev_year)), levels = lev_month),
+  AREA       = factor(rep(ref_AREA,  length(lev_year)), levels = lev_area),
+  TIEDN_PRES = factor(rep(ref_TIED,  length(lev_year)), levels = lev_tied),
+  DEPTH_num  = rep(ref_DEPTH, length(lev_year))
+)
+
+prS <- predict(
+  south_gam,
+  newdata = newdat_year_obsS,
+  type    = "link",
+  se.fit  = TRUE,
+  exclude = c("factor(MONTHHBEG)", "factor(AREA)", "TIEDN_PRES", "s(DEPTH_num)")
+)
+
+south_observer_index <- tibble(
+  YEAR  = as.numeric(as.character(newdat_year_obsS$YEARHBEG)),
+  Index = exp(prS$fit),
+  LCL   = exp(prS$fit - 1.96 * prS$se.fit),
+  UCL   = exp(prS$fit + 1.96 * prS$se.fit)
+) %>%
+  arrange(YEAR) %>%
+  mutate(Index_rel = Index / Index[1])
+
+
+```
